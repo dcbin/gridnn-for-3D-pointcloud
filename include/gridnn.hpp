@@ -3,22 +3,35 @@
  * https://github.com/gaoxiang12/slam_in_autonomous_driving.git
  */
 
+/**
+ * @brief 实现逻辑：
+ *        1.定义转化函数,把点云中的点转化到栅格坐标中,做法是:(point * resolution_inv).cast<int>
+ *        2.对点云中的每个点,调用步骤1中的函数,把栅格坐标作为Key,点在点云中的索引作为Value,哈希函数采用
+ *          向量哈希,存储到std::unordered_map中.
+ *        3.根据用户需要的近邻关系(0、6、14近邻),从原始点云中取出
+ */
+
 #ifndef GRIDNN_HPP
 #define GRIDNN_HPP
 
 #include <unordered_map>
 #include <glog/logging.h>
-#include <bfnn.hpp>
+#include "bfnn.hpp"
+#include <mutex>
 
+namespace gridnn{
 
+// 3d整数向量 
 using Vec3i = Eigen::Vector3i;
+// pcl::PointXYZI
 using PointType = pcl::PointXYZI;
+// pcl::PointXYZI构成的点云
 using CloudType = pcl::PointCloud<PointType>;
 using CloudPtr = CloudType::Ptr;
 
 
 /**
- * @brief 定义向量哈希的哈希映射关系:向量的每个分量与分别与不同的大质数相乘再取异或,最后对结果除个大整数取模.
+ * @brief 定义向量哈希的哈希映射关系:向量的每个分量分别与不同的大质数相乘再取异或,最后对结果除个大整数取模.
  *        哈希函数的运算结果并不是直接决定key对应的value,而是用于定位key-value对在哈希表中的存储位置.
  *        具体来说,哈希函数的作用是将key映射为一个整数值(哈希值),这个整数值进一步被用来定位哈希表中的存储桶（bucket）。
  */
@@ -29,10 +42,10 @@ struct hash_vec
 
 
 /**
- * @brief 1.定义转化函数,把点云中的点转化到栅格坐标中,做法是:(point * resolution_inv).cast<int>
- *        2.对点云中的每个点,调用步骤1中的函数,把栅格坐标作为Key,点在点云中的索引作为Value,哈希函数采用
- *          向量哈希,存储到std::unordered_map中.
- *        3.根据用户需要的近邻关系(0、6、14近邻),从原始点云中取出
+ * @brief 使用方法：
+ *        1.创建一个GridNN对象,需要传入采样率和待搜索的最近邻栅格两个参数
+ *        2.调用GenerateHashTable()方法
+ *        3.调用GetClosetCloudMt()方法
  */
 class GridNN
 {
@@ -50,7 +63,7 @@ private:
     float resolution_ = 0.2;
     // 分辨率倒数,方便求某个点在栅格坐标系下的位置
     float resolution_inv_ = 1.0 / resolution_;
-    // 存放某个点的近邻栅格或体素信息
+    // 存放某个点的近邻栅格或近邻体素信息
     std::vector<KeyType> nearby_grids_;
     NearbyType nearby_type_ = NearbyType::NEARBY6;
 
@@ -66,11 +79,15 @@ private:
 
 public:
 
+    /**
+     * @param resolution 栅格边长
+     * @param nearby_type 选择哪几个栅格作为搜索区域
+     */
     explicit GridNN(float resolution = 0.1, NearbyType nearby_type = NearbyType::NEARBY6)
         :resolution_(resolution), nearby_type_(nearby_type){
         resolution_inv_ = 1.0 / resolution;
-        if(nearby_type_ != NearbyType::NEARBY6 ||
-           nearby_type_ != NearbyType::NEARBY14 ||
+        if(nearby_type_ != NearbyType::NEARBY6 &&
+           nearby_type_ != NearbyType::NEARBY14 &&
            nearby_type_ != NearbyType::CENTER){
             LOG(ERROR) << "三维栅格只能使用0、6、14近邻,将使用6近邻.";
             nearby_type_ = NearbyType::NEARBY6;
@@ -78,15 +95,30 @@ public:
         GenerateNearbyGrids();
     };
 
+private:
     /**
      * @brief 将空间坐标转换为栅格坐标
      * @param point 待转换的扫描点坐标、
      * @return 该扫描点的栅格坐标,将作为哈希表的Key值
      */
     Eigen::Matrix<int, 3, 1> pos2grid(const Eigen::Matrix<float, 3, 1>& point);
-    void GenerateHashTable(const CloudPtr& ptr);
     void GenerateNearbyGrids();
+
+    /**
+     * @brief 使用栅格法查找某个点在目标点云中的最近邻
+     * @param point 待查找最近邻的点
+     * @param closet_point 查找点的最近邻点
+     */
     bool GetClosetPoint(const PointType& point, PointType& closet_point, int& idx);
+
+public:
+
+    void GenerateHashTable(const CloudPtr& ptr);
+    /**
+     * @brief 多线程栅格法点云匹配
+     * @param cloud_query 需要匹配的点云,即对于cloud_ptr中的每一个点,在已经创建的栅格点云搜索其最近邻点
+     * @param matches 匹配结果
+     */
     bool GetClosetCloudMt(const CloudPtr cloud_query,
                           std::vector<std::pair<size_t, size_t>>& matches);
 
@@ -131,7 +163,10 @@ bool GridNN::GetClosetPoint(const PointType& point, PointType& closet_point, int
             if (iter != grids_.end()){
                 idx_to_check.insert(idx_to_check.end(), iter->second.begin(), iter->second.end());}});
     }
-
+    else{
+        LOG(ERROR) << "没有与该点对应的栅格,可能是因为该点过于离群";
+        return false;
+    }
     // 根据近邻栅格和点云构建暴力搜索的目标点云
     CloudPtr nearby_cloud(new CloudType);
 
@@ -158,16 +193,24 @@ bool GridNN::GetClosetCloudMt(const CloudPtr cloud_query,
                               std::vector<std::pair<size_t, size_t>>& matches)
 {
     matches.resize(cloud_query -> size());
+    LOG(ERROR) << "匹配向量大小"<< matches.size();
     std::vector<size_t> index(cloud_query -> size());
     std::for_each(index.begin(), index.end(), [i = 0](auto& idx)mutable{idx = i++;});
     
     PointType closet_point;
-    size_t closet_idx;
+    int closet_idx;
+
+    // matches是线程不安全的,使用线程锁确保线程安全
+    std::mutex mutex;
     std::for_each(std::execution::par_unseq, index.begin(), index.end(),
-                 [&matches, &cloud_query, this](auto& idx)
+                 [&matches, &cloud_query, &closet_idx, &closet_point, &mutex, this](auto& idx)
     {
+        LOG(ERROR) << "查找第" << idx << "个点的最近邻";
         if(GetClosetPoint(cloud_query -> points[idx], closet_point, closet_idx)){
+            // 某个线程进入此代码段时,他会首先获取线程锁mutex,阻止其他线程修改matches
+            std::lock_guard<std::mutex> lock(mutex);
             matches.emplace_back(idx, closet_idx);
+            LOG(ERROR) << "查找第" << idx << "个点的最近邻完毕";
         }
     });
     return true;
@@ -177,11 +220,13 @@ bool GridNN::GetClosetCloudMt(const CloudPtr cloud_query,
 void GridNN::GenerateNearbyGrids(){
     if (this -> nearby_type_ == NearbyType::CENTER){
         this -> nearby_grids_ = {Vec3i(0, 0, 0)};
+        LOG(ERROR) <<"创建近邻栅格类型";
     }
     else if (this -> nearby_type_ == NearbyType::NEARBY6){
         this -> nearby_grids_ = {Vec3i(0, 0, 0), Vec3i(0, 0, 1), Vec3i(0, 1, 0),
                                  Vec3i(1, 0, 0), Vec3i(0, 0, -1), Vec3i(0, -1, 0), 
                                  Vec3i(-1, 0, 0)};
+        LOG(ERROR) <<"创建近邻栅格类型";
     }
     else if (this -> nearby_type_ == NearbyType::NEARBY14){
         this -> nearby_grids_ = {Vec3i(0, 0, 0), Vec3i(0, 0, 1), Vec3i(0, 1, 0),
@@ -189,6 +234,7 @@ void GridNN::GenerateNearbyGrids(){
                                  Vec3i(-1, 0, 0), Vec3i(-1, 0, 0), Vec3i(1, 1, 1),
                                  Vec3i(1, 1, -1), Vec3i(1, -1, 1), Vec3i(-1, 1, 1),
                                  Vec3i(1, -1, -1), Vec3i(-1, -1, 1), Vec3i(-1, 1, -1)};
+        LOG(ERROR) <<"创建近邻栅格类型";
     }
     else{
         LOG(ERROR) << "近邻栅格参数错误.";
@@ -203,3 +249,4 @@ inline size_t hash_vec::operator()(const Eigen::Matrix<int, 3, 1>& vec) const{
     return (vec[0, 0] * 73856093) ^ (vec[1, 0] * 471943) ^ (vec[2, 0] * 83492791) % 10000000;
 }
 #endif
+}
